@@ -18,6 +18,7 @@ type Glyph = {
   vy: number
   angle: number
   angularVelocity: number
+  spinUntil: number
   mass: number
   held: boolean
   alive: boolean
@@ -346,6 +347,8 @@ function App() {
       glyph.alive = true
       glyph.respawnAt = 0
       glyph.held = false
+      glyph.angularVelocity = 0
+      glyph.spinUntil = 0
       glyph.vy = style === 'bubble'
         ? -Math.max(lift, Math.abs(glyph.vy) * .65)
         : Math.max(lift, Math.abs(glyph.vy) * .65)
@@ -361,7 +364,7 @@ function App() {
     contactsRef.current.clear()
     popEffectsRef.current = []
     for (const glyph of glyphsRef.current) {
-      glyph.ox = 0; glyph.oy = 0; glyph.vx = 0; glyph.vy = 0; glyph.angle = 0; glyph.angularVelocity = 0; glyph.held = false; glyph.alive = true; glyph.respawnAt = 0
+      glyph.ox = 0; glyph.oy = 0; glyph.vx = 0; glyph.vy = 0; glyph.angle = 0; glyph.angularVelocity = 0; glyph.spinUntil = 0; glyph.held = false; glyph.alive = true; glyph.respawnAt = 0
     }
     dragRef.current = null
   }, [])
@@ -399,6 +402,8 @@ function App() {
     glyph.held = true
     glyph.vx = 0
     glyph.vy = 0
+    glyph.angularVelocity = 0
+    glyph.spinUntil = 0
     dragRef.current = { index: best, dx: glyph.x + glyph.ox - x, dy: glyph.y + glyph.oy - y, source, lastX: x, lastY: y, lastTime: performance.now() }
     return true
   }, [glyphIndexAt, releaseDrag])
@@ -438,8 +443,11 @@ function App() {
     const sampleVy = Math.max(-maxThrowSpeed, Math.min(maxThrowSpeed, (y - drag.lastY) / dt))
     glyph.vx += (sampleVx - glyph.vx) * .42
     glyph.vy += (sampleVy - glyph.vy) * .42
-    glyph.angularVelocity += ((sampleVx / Math.max(1, glyph.r)) * .28 - glyph.angularVelocity) * .18
-    glyph.angularVelocity = Math.max(-8, Math.min(8, glyph.angularVelocity))
+    if (Math.hypot(sampleVx, sampleVy) > 80 * Math.min(devicePixelRatio, 1)) {
+      glyph.spinUntil = now + 2000
+      glyph.angularVelocity += ((sampleVx / Math.max(1, glyph.r)) * .28 - glyph.angularVelocity) * .18
+      glyph.angularVelocity = Math.max(-8, Math.min(8, glyph.angularVelocity))
+    }
     glyph.ox = x + drag.dx - glyph.x
     glyph.oy = y + drag.dy - glyph.y
     drag.lastX = x
@@ -737,7 +745,7 @@ function App() {
           const radiusY = size * .36
           glyphs.push({
             id: glyphId++, ch: char, x: x + width / 2, y: startY + index * lineHeight, width, r: Math.sqrt(radiusX * radiusY), rx: radiusX, ry: radiusY, fontSize: size,
-            ox: 0, oy: 0, vx: 0, vy: 0, angle: 0, angularVelocity: 0,
+            ox: 0, oy: 0, vx: 0, vy: 0, angle: 0, angularVelocity: 0, spinUntil: 0,
             mass: Math.max(.65, width / Math.max(1, size)), held: false, alive: true, respawnAt: 0,
           })
           x += width + tracking
@@ -786,13 +794,15 @@ function App() {
           glyph.oy = canvas.height - extentY - canvas.height * .035 - glyph.y
           glyph.vx = (Math.random() - .5) * canvas.width * .11
           glyph.vy = -canvas.height * (.20 + Math.random() * .08)
-          glyph.angularVelocity = (Math.random() - .5) * .65
+          glyph.angle = 0
+          glyph.angularVelocity = 0
+          glyph.spinUntil = 0
         }
       }
       const glyphs = glyphsRef.current.filter((glyph) => glyph.alive && glyph.ch.trim())
       const gravity = canvas.height * (bubble ? -.34 : 1.35)
       const linearDamping = Math.pow(bubble ? .991 : .994, dt * 60)
-      const angularDamping = Math.pow(bubble ? .982 : .988, dt * 60)
+      const angularDamping = Math.pow(bubble ? .975 : .98, dt * 60)
       const velocityLimit = 3200 * Math.min(devicePixelRatio, 1)
       const smoothImpact = (speed: number, low: number, high: number, minimum: number, maximum: number) => {
         const linear = Math.max(0, Math.min(1, (speed - low) / (high - low)))
@@ -804,14 +814,17 @@ function App() {
           glyph.vy += gravity * dt
           if (bubble) {
             glyph.vx += Math.sin(now * .00072 + glyph.id * 1.91) * canvas.width * .018 * dt
-            glyph.angularVelocity += Math.sin(now * .00053 + glyph.id * 2.37) * .11 * dt
           }
           glyph.vx *= linearDamping
           glyph.vy *= linearDamping
-          glyph.angularVelocity *= angularDamping
           glyph.ox += glyph.vx * dt
           glyph.oy += glyph.vy * dt
-          glyph.angle += glyph.angularVelocity * dt
+          if (now < glyph.spinUntil) {
+            glyph.angularVelocity *= angularDamping
+            glyph.angle += glyph.angularVelocity * dt
+          } else {
+            glyph.angularVelocity = 0
+          }
         }
       }
 
@@ -882,9 +895,18 @@ function App() {
               const impulseX = impulse * nx, impulseY = impulse * ny
               if (!a.held) { a.vx -= impulseX * invA; a.vy -= impulseY * invA }
               if (!b.held) { b.vx += impulseX * invB; b.vy += impulseY * invB }
-              const tangentSpeed = relativeX * -ny + relativeY * nx
-              if (!a.held) a.angularVelocity -= tangentSpeed / Math.max(1, a.r) * .055
-              if (!b.held) b.angularVelocity += tangentSpeed / Math.max(1, b.r) * .055
+              const externallyDriven = a.held || b.held || now < a.spinUntil || now < b.spinUntil
+              if (externallyDriven && impactSpeed > 120 * Math.min(devicePixelRatio, 1)) {
+                const tangentSpeed = relativeX * -ny + relativeY * nx
+                if (!a.held) {
+                  a.spinUntil = now + 1600
+                  a.angularVelocity -= tangentSpeed / Math.max(1, a.r) * .055
+                }
+                if (!b.held) {
+                  b.spinUntil = now + 1600
+                  b.angularVelocity += tangentSpeed / Math.max(1, b.r) * .055
+                }
+              }
             }
           }
         }
@@ -897,8 +919,8 @@ function App() {
         const extentX = cosine * glyph.rx + sine * glyph.ry
         const extentY = sine * glyph.rx + cosine * glyph.ry
         const wallBounce = bubble ? .28 : smoothImpact(Math.abs(glyph.vx), 180, 1500, .12, .5)
-        if (cx < extentX) { glyph.ox += extentX - cx; glyph.vx = Math.abs(glyph.vx) * wallBounce; glyph.angularVelocity *= .82; cx = extentX }
-        if (cx > canvas.width - extentX) { glyph.ox -= cx - (canvas.width - extentX); glyph.vx = -Math.abs(glyph.vx) * wallBounce; glyph.angularVelocity *= .82 }
+        if (cx < extentX) { glyph.ox += extentX - cx; glyph.vx = Math.abs(glyph.vx) * wallBounce; cx = extentX }
+        if (cx > canvas.width - extentX) { glyph.ox -= cx - (canvas.width - extentX); glyph.vx = -Math.abs(glyph.vx) * wallBounce }
         if (bubble) {
           const ceiling = canvas.height * .055 + extentY
           if (cy < ceiling) {
@@ -916,9 +938,7 @@ function App() {
         if (cy > canvas.height - extentY) {
           glyph.oy -= cy - (canvas.height - extentY)
           if (glyph.vy > 0) glyph.vy *= -(bubble ? .18 : smoothImpact(glyph.vy, 200, 1600, .1, .44))
-          glyph.angularVelocity += glyph.vx / Math.max(1, glyph.r) * .025
           glyph.vx *= .82
-          glyph.angularVelocity *= .74
         }
         glyph.vx = Math.max(-velocityLimit, Math.min(velocityLimit, glyph.vx))
         glyph.vy = Math.max(-velocityLimit, Math.min(velocityLimit, glyph.vy))
