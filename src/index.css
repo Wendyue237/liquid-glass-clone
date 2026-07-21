@@ -1,0 +1,35 @@
+@import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@800&display=swap');
+@import "tailwindcss";
+
+:root {
+  font-family: "Baloo 2", "Arial Rounded MT Bold", Nunito, system-ui, sans-serif;
+  color: white;
+  background: #0a0e14;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+button, input, select { font: inherit; }
+button { cursor: pointer; }
+
+.glass-range {
+  height: 12px;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+.glass-range::-webkit-slider-runnable-track { height: 3px; border-radius: 2px; background: rgba(255,255,255,.25); }
+.glass-range::-webkit-slider-thumb {
+  width: 12px; height: 12px; margin-top: -4.5px; border: 0; border-radius: 999px;
+  -webkit-appearance: none; appearance: none; background: white; box-shadow: 0 1px 4px rgba(0,0,0,.45);
+}
+.glass-range::-moz-range-track { height: 3px; border-radius: 2px; background: rgba(255,255,255,.25); }
+.glass-range::-moz-range-thumb { width: 12px; height: 12px; border: 0; border-radius: 999px; background: white; box-shadow: 0 1px 4px rgba(0,0,0,.45); }
+
+@media (max-width: 430px) {
+  .glass-range::-webkit-slider-thumb { width: 12px; height: 12px; }
+}
