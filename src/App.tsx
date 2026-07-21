@@ -28,8 +28,8 @@ type Glyph = {
 type Drag = { index: number; dx: number; dy: number; source: 'hand' | 'pointer'; lastX: number; lastY: number; lastTime: number }
 type HandPoint = { x: number; y: number }
 type StyleMode = 'liquid glass' | 'bubble' | 'fire'
-type PopDroplet = { angle: number; speed: number; size: number; hue: number }
-type PopEffect = { ch: string; x: number; y: number; angle: number; fontSize: number; radius: number; startedAt: number; droplets: PopDroplet[] }
+type PopDroplet = { angle: number; speed: number; size: number; hue: number; curve: number }
+type PopEffect = { x: number; y: number; fontSize: number; radius: number; startedAt: number; droplets: PopDroplet[] }
 type ContactState = { startedAt: number; cooldownUntil: number }
 
 type Params = {
@@ -420,13 +420,14 @@ function App() {
     glyph.vx = 0
     glyph.vy = 0
     if (dragRef.current?.index === index) dragRef.current = null
-    const droplets = Array.from({ length: 22 }, (_, dropletIndex): PopDroplet => ({
-      angle: (Math.PI * 2 * dropletIndex) / 22 + (Math.random() - .5) * .38,
-      speed: glyph.fontSize * (.52 + Math.random() * .72),
-      size: Math.max(1.8, glyph.fontSize * (.01 + Math.random() * .016)),
-      hue: [184, 312, 48][dropletIndex % 3],
+    const droplets = Array.from({ length: 12 }, (_, dropletIndex): PopDroplet => ({
+      angle: Math.random() * Math.PI * 2,
+      speed: glyph.fontSize * (.34 + Math.random() * .52),
+      size: Math.max(1.2, glyph.fontSize * (.006 + Math.random() * .01)),
+      hue: [188, 208, 295, 52][dropletIndex % 4],
+      curve: (Math.random() - .5) * glyph.r * .55,
     }))
-    popEffectsRef.current.push({ ch: glyph.ch, x: glyph.x + glyph.ox, y: glyph.y + glyph.oy, angle: glyph.angle, fontSize: glyph.fontSize, radius: glyph.r, startedAt: now, droplets })
+    popEffectsRef.current.push({ x, y, fontSize: glyph.fontSize, radius: glyph.r, startedAt: now, droplets })
     contactsRef.current.clear()
     return true
   }, [glyphIndexAt])
@@ -959,7 +960,7 @@ function App() {
     }
 
     function drawPopEffects(now: number) {
-      const duration = 560
+      const duration = 480
       const active = popEffectsRef.current.filter((effect) => now - effect.startedAt < duration)
       popEffectsRef.current = active
       if (!active.length) {
@@ -976,83 +977,61 @@ function App() {
       for (const effect of active) {
         const elapsed = now - effect.startedAt
         const age = Math.min(1, elapsed / duration)
-        const opacity = Math.pow(1 - age, .9)
+        const opacity = Math.pow(1 - age, 1.2)
 
-        const flashAge = Math.min(1, elapsed / 150)
+        const flashAge = Math.min(1, elapsed / 115)
         if (flashAge < 1) {
-          const flashRadius = effect.radius * (1.05 + flashAge * .65)
+          const flashRadius = effect.radius * (.2 + flashAge * .52)
           const gradient = fxCtx.createRadialGradient(effect.x, effect.y, 0, effect.x, effect.y, flashRadius)
-          gradient.addColorStop(0, `rgba(255,255,255,${(1 - flashAge) * .58})`)
-          gradient.addColorStop(.28, `hsla(184,100%,88%,${(1 - flashAge) * .34})`)
-          gradient.addColorStop(.68, `hsla(312,100%,86%,${(1 - flashAge) * .18})`)
+          gradient.addColorStop(0, `rgba(255,255,255,${(1 - flashAge) * .62})`)
+          gradient.addColorStop(.18, `rgba(236,252,255,${(1 - flashAge) * .3})`)
+          gradient.addColorStop(.55, `hsla(195,70%,88%,${(1 - flashAge) * .12})`)
           gradient.addColorStop(1, 'rgba(255,255,255,0)')
           fxCtx.fillStyle = gradient
           fxCtx.fillRect(effect.x - flashRadius, effect.y - flashRadius, flashRadius * 2, flashRadius * 2)
         }
 
+        const seconds = elapsed / 1000
         fxCtx.save()
         fxCtx.globalCompositeOperation = 'screen'
-        for (let ring = 0; ring < 3; ring++) {
-          const ringAge = Math.max(0, Math.min(1, (age - ring * .055) / (1 - ring * .055)))
-          if (ringAge <= 0) continue
-          const ringEase = 1 - Math.pow(1 - ringAge, 3)
-          const ringOpacity = Math.pow(1 - ringAge, 1.7) * (.9 - ring * .17)
-          const ringRadius = effect.radius * (.34 + ringEase * (1.75 + ring * .16))
+        for (const droplet of effect.droplets) {
+          const directionX = Math.cos(droplet.angle)
+          const directionY = Math.sin(droplet.angle)
+          const distance = effect.radius * .06 + droplet.speed * seconds * (1 + age * .75)
+          const gravity = effect.fontSize * .42 * seconds * seconds
+          const tail = effect.radius * (.34 * (1 - age) + .06)
+          const startX = effect.x + directionX * Math.max(0, distance - tail)
+          const startY = effect.y + directionY * Math.max(0, distance - tail) + gravity * .35
+          const endX = effect.x + directionX * distance
+          const endY = effect.y + directionY * distance + gravity
+          const middleX = (startX + endX) * .5 - directionY * droplet.curve * (1 - age)
+          const middleY = (startY + endY) * .5 + directionX * droplet.curve * (1 - age)
+          const filmGradient = fxCtx.createLinearGradient(startX, startY, endX, endY)
+          filmGradient.addColorStop(0, 'rgba(255,255,255,0)')
+          filmGradient.addColorStop(.42, `hsla(${droplet.hue},72%,90%,${opacity * .48})`)
+          filmGradient.addColorStop(.74, `rgba(255,255,255,${opacity * .76})`)
+          filmGradient.addColorStop(1, `hsla(${droplet.hue},68%,88%,${opacity * .18})`)
           fxCtx.beginPath()
-          fxCtx.arc(effect.x, effect.y, ringRadius, 0, Math.PI * 2)
-          fxCtx.strokeStyle = `hsla(${[184, 312, 48][ring]},100%,88%,${ringOpacity})`
-          fxCtx.lineWidth = Math.max(1, effect.fontSize * (.026 - ring * .004) * (1 - ringAge * .65))
-          fxCtx.shadowColor = `hsla(${[184, 312, 48][ring]},100%,78%,${ringOpacity})`
-          fxCtx.shadowBlur = effect.fontSize * .09
+          fxCtx.moveTo(startX, startY)
+          fxCtx.quadraticCurveTo(middleX, middleY, endX, endY)
+          fxCtx.strokeStyle = filmGradient
+          fxCtx.lineCap = 'round'
+          fxCtx.lineWidth = Math.max(.7, droplet.size * (1.75 - age))
+          fxCtx.shadowColor = `rgba(220,246,255,${opacity * .35})`
+          fxCtx.shadowBlur = droplet.size * 1.6
           fxCtx.stroke()
-        }
-        fxCtx.restore()
 
-        const collapseAge = Math.min(1, age / .7)
-        const pulse = Math.sin(Math.min(1, age / .2) * Math.PI) * .1
-        fxCtx.save()
-        fxCtx.translate(effect.x, effect.y)
-        fxCtx.rotate(effect.angle)
-        fxCtx.scale(1 + pulse - collapseAge * .48, 1 + pulse * .45 - collapseAge * .48)
-        fxCtx.font = `800 ${effect.fontSize}px "Baloo 2", "Arial Rounded MT Bold", sans-serif`
-        fxCtx.textAlign = 'center'
-        fxCtx.textBaseline = 'middle'
-        fxCtx.lineJoin = 'round'
-        fxCtx.globalCompositeOperation = 'screen'
-        fxCtx.shadowColor = `rgba(255,255,255,${opacity * .8})`
-        fxCtx.shadowBlur = effect.fontSize * .075
-        fxCtx.fillStyle = `rgba(255,255,255,${opacity * .1})`
-        fxCtx.fillText(effect.ch, 0, 0)
-        fxCtx.lineWidth = Math.max(1.8, effect.fontSize * .024)
-        for (const [offset, color] of [[-2.2, `hsla(184,100%,88%,${opacity})`], [0, `hsla(312,100%,88%,${opacity * .9})`], [2.2, `hsla(48,100%,88%,${opacity * .88})`]] as const) {
           fxCtx.save()
-          fxCtx.translate(offset, 0)
-          fxCtx.strokeStyle = color
-          fxCtx.strokeText(effect.ch, 0, 0)
+          fxCtx.translate(endX, endY)
+          fxCtx.rotate(droplet.angle)
+          fxCtx.scale(1.45, .72)
+          fxCtx.beginPath()
+          fxCtx.arc(0, 0, droplet.size * (1 - age * .62), 0, Math.PI * 2)
+          fxCtx.fillStyle = `rgba(245,253,255,${opacity * .72})`
+          fxCtx.fill()
           fxCtx.restore()
         }
         fxCtx.restore()
-
-        const seconds = elapsed / 1000
-        for (const droplet of effect.droplets) {
-          const distance = droplet.speed * seconds
-          const px = effect.x + Math.cos(droplet.angle) * distance
-          const py = effect.y + Math.sin(droplet.angle) * distance + effect.fontSize * .7 * seconds * seconds
-          const tail = Math.min(effect.fontSize * .1, distance * .16)
-          fxCtx.beginPath()
-          fxCtx.moveTo(px - Math.cos(droplet.angle) * tail, py - Math.sin(droplet.angle) * tail)
-          fxCtx.lineTo(px, py)
-          fxCtx.strokeStyle = `hsla(${droplet.hue},100%,88%,${opacity * .5})`
-          fxCtx.lineWidth = Math.max(1, droplet.size * .45)
-          fxCtx.stroke()
-          fxCtx.beginPath()
-          fxCtx.arc(px, py, droplet.size * (1 - age * .58), 0, Math.PI * 2)
-          fxCtx.fillStyle = `hsla(${droplet.hue},100%,90%,${opacity * .9})`
-          fxCtx.shadowColor = `hsla(${droplet.hue},100%,78%,${opacity})`
-          fxCtx.shadowBlur = droplet.size * 3
-          fxCtx.fill()
-        }
-        fxCtx.shadowBlur = 0
       }
     }
 
