@@ -3,6 +3,7 @@ import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision'
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 
 type Glyph = {
+  id: number
   ch: string
   x: number
   y: number
@@ -19,10 +20,16 @@ type Glyph = {
   angularVelocity: number
   mass: number
   held: boolean
+  alive: boolean
+  respawnAt: number
 }
 
 type Drag = { index: number; dx: number; dy: number; source: 'hand' | 'pointer'; lastX: number; lastY: number; lastTime: number }
 type HandPoint = { x: number; y: number }
+type StyleMode = 'liquid glass' | 'bubble' | 'fire'
+type PopDroplet = { angle: number; speed: number; size: number; hue: number }
+type PopEffect = { ch: string; x: number; y: number; angle: number; fontSize: number; startedAt: number; droplets: PopDroplet[] }
+type ContactState = { startedAt: number; cooldownUntil: number }
 
 type Params = {
   textScale: number
@@ -121,6 +128,7 @@ uniform float u_frost;
 uniform float u_irid;
 uniform float u_shadow;
 uniform float u_fire;
+uniform float u_bubble;
 in vec2 v_uv;
 out vec4 outColor;
 
@@ -170,7 +178,8 @@ vec3 bgBlur(vec2 uv, float radius) {
   return sum;
 }
 float profile(float height) {
-  float t = clamp((height - u_thresh) / (1. - u_thresh), 0., 1.);
+  float threshold = min(.82, u_thresh + (u_bubble > .5 ? .018 : 0.));
+  float t = clamp((height - threshold) / (1. - threshold), 0., 1.);
   float k = 1. - t;
   return sqrt(max(1. - k * k, 0.));
 }
@@ -186,11 +195,13 @@ void main() {
   float aspect = u_resolution.x / u_resolution.y;
   float rawHeight = texture(u_height, uv).r + (hash(uv * u_resolution) - .5) * .004;
   float antialias = fwidth(rawHeight) * 1.2 + .002;
-  float shape = smoothstep(u_thresh - antialias, u_thresh + antialias, rawHeight);
+  float threshold = min(.82, u_thresh + (u_bubble > .5 ? .018 : 0.));
+  float shape = smoothstep(threshold - antialias, threshold + antialias, rawHeight);
   vec3 background = bg(uv);
   if (u_shadow > .001) {
     float shadowHeight = profile(texture(u_height, uv + vec2(-.012,.016)).r);
-    background *= 1. - u_shadow * shadowHeight * (1. - shape);
+    float shadowStrength = u_bubble > .5 ? u_shadow * .08 : u_shadow;
+    background *= 1. - shadowStrength * shadowHeight * (1. - shape);
   }
   if (shape < .001) { outColor = vec4(pow(background, vec3(.98)), 1.); return; }
 
@@ -203,11 +214,33 @@ void main() {
 
   float thickness = u_refract * (.35 + .65 * (1. - height));
   vec3 incident = vec3(0.,0.,-1.);
-  vec3 refractR = refract(incident, normal, 1. / 1.5);
   vec3 refractG = refract(incident, normal, 1. / (1.5 + u_disperse));
+  vec2 axis = vec2(1. / aspect, 1.);
+  if (u_bubble > .5) {
+    float bubbleEdge = pow(clamp(1. - normal.z, 0., 1.), .72);
+    float drift = noise(uv * 18. + vec2(u_time * .07, -u_time * .05));
+    float bubblePhase = (1. - height) * 3.4 + bubbleEdge * 1.8 + drift * .38;
+    vec3 membrane = .5 + .5 * cos(TAU * bubblePhase + vec3(0., 2.1, 4.2));
+    vec3 transmitted = bg(uv + refractG.xy * thickness * axis * .34);
+    vec3 view = vec3(0.,0.,1.);
+    vec3 reflected = reflect(incident, normal);
+    float bubbleFresnel = min((.025 + .975 * pow(clamp(1. - normal.z, 0., 1.), 5.)) * u_fresnel, 1.);
+    vec3 environment = bg(clamp(uv + reflected.xy * .13 * axis, 0., 1.)) * .16 + vec3(softbox(reflected)) * .44;
+    vec3 sunDir = normalize(vec3(-.58, .68, .46));
+    float sun = pow(max(dot(normal, normalize(sunDir + view)), 0.), 150.) * 1.75;
+    float softSun = pow(max(dot(normal, normalize(vec3(-.35, .62, .70) + view)), 0.), 28.) * .16;
+    vec3 bubbleGlass = transmitted * .94
+      + membrane * (bubbleEdge * .34 + .025) * (1.05 + u_irid * .16)
+      + environment * bubbleFresnel
+      + vec3(1., .91, .72) * sun
+      + vec3(.82, .94, 1.) * softSun;
+    outColor = vec4(pow(mix(background, bubbleGlass, shape), vec3(.98)), 1.);
+    return;
+  }
+
+  vec3 refractR = refract(incident, normal, 1. / 1.5);
   vec3 refractB = refract(incident, normal, 1. / (1.5 + u_disperse * 2.));
   float frost = u_frost * (1. - sharp * .75);
-  vec2 axis = vec2(1. / aspect, 1.);
   vec3 refracted;
   refracted.r = bgBlur(uv + refractR.xy * thickness * axis, frost).r;
   refracted.g = bgBlur(uv + refractG.xy * thickness * axis, frost).g;
@@ -275,14 +308,17 @@ function createProgram(gl: WebGL2RenderingContext, fragment: string) {
 
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const fxCanvasRef = useRef<HTMLCanvasElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const paramsRef = useRef(defaults)
   const textRef = useRef('LIQUID GLASS')
   const cameraReadyRef = useRef(false)
   const cameraChoiceRef = useRef('camera')
-  const styleRef = useRef('liquid glass')
+  const styleRef = useRef<StyleMode>('liquid glass')
   const glyphsRef = useRef<Glyph[]>([])
   const dragRef = useRef<Drag | null>(null)
+  const popEffectsRef = useRef<PopEffect[]>([])
+  const contactsRef = useRef(new Map<string, ContactState>())
   const resetEpochRef = useRef(0)
   const [params, setParams] = useState(defaults)
   const [text, setText] = useState('LIQUID GLASS')
@@ -292,22 +328,40 @@ function App() {
   const [cameraNotice, setCameraNotice] = useState('')
   const [cameraChoice, setCameraChoice] = useState('camera')
   const [cameraName, setCameraName] = useState('camera')
-  const [style, setStyle] = useState('liquid glass')
+  const [style, setStyle] = useState<StyleMode>('liquid glass')
   const [handStatus, setHandStatus] = useState<'LOADING' | 'READY' | 'NO HAND'>('LOADING')
   const [handPoints, setHandPoints] = useState<{ thumb: HandPoint; index: HandPoint; pinch: boolean } | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => { paramsRef.current = params }, [params])
   useEffect(() => { textRef.current = text }, [text])
-  useEffect(() => { styleRef.current = style }, [style])
+  useEffect(() => {
+    const previous = styleRef.current
+    styleRef.current = style
+    if (previous === style) return
+    contactsRef.current.clear()
+    popEffectsRef.current = []
+    const lift = 80 * Math.min(devicePixelRatio, 1)
+    for (const glyph of glyphsRef.current) {
+      glyph.alive = true
+      glyph.respawnAt = 0
+      glyph.held = false
+      glyph.vy = style === 'bubble'
+        ? -Math.max(lift, Math.abs(glyph.vy) * .65)
+        : Math.max(lift, Math.abs(glyph.vy) * .65)
+    }
+    dragRef.current = null
+  }, [style])
   useEffect(() => { cameraChoiceRef.current = cameraChoice }, [cameraChoice])
 
   const reset = useCallback(() => {
     setParams(defaults)
     setText('LIQUID GLASS')
     resetEpochRef.current++
+    contactsRef.current.clear()
+    popEffectsRef.current = []
     for (const glyph of glyphsRef.current) {
-      glyph.ox = 0; glyph.oy = 0; glyph.vx = 0; glyph.vy = 0; glyph.angle = 0; glyph.angularVelocity = 0; glyph.held = false
+      glyph.ox = 0; glyph.oy = 0; glyph.vx = 0; glyph.vy = 0; glyph.angle = 0; glyph.angularVelocity = 0; glyph.held = false; glyph.alive = true; glyph.respawnAt = 0
     }
     dragRef.current = null
   }, [])
@@ -320,11 +374,11 @@ function App() {
     dragRef.current = null
   }, [])
 
-  const pickGlyph = useCallback((x: number, y: number, source: Drag['source']) => {
+  const glyphIndexAt = useCallback((x: number, y: number) => {
     let best = -1
     let bestDistance = Infinity
     glyphsRef.current.forEach((glyph, index) => {
-      if (!glyph.ch.trim()) return
+      if (!glyph.alive || !glyph.ch.trim()) return
       const dx = x - glyph.x - glyph.ox
       const dy = y - glyph.y - glyph.oy
       const cosine = Math.cos(glyph.angle), sine = Math.sin(glyph.angle)
@@ -334,6 +388,11 @@ function App() {
       const distance = Math.hypot(dx, dy)
       if (hit <= 1.25 && distance < bestDistance) { best = index; bestDistance = distance }
     })
+    return best
+  }, [])
+
+  const pickGlyph = useCallback((x: number, y: number, source: Drag['source']) => {
+    const best = glyphIndexAt(x, y)
     if (best < 0) return false
     releaseDrag()
     const glyph = glyphsRef.current[best]
@@ -342,7 +401,30 @@ function App() {
     glyph.vy = 0
     dragRef.current = { index: best, dx: glyph.x + glyph.ox - x, dy: glyph.y + glyph.oy - y, source, lastX: x, lastY: y, lastTime: performance.now() }
     return true
-  }, [releaseDrag])
+  }, [glyphIndexAt, releaseDrag])
+
+  const popGlyphAt = useCallback((x: number, y: number) => {
+    if (styleRef.current !== 'bubble') return false
+    const index = glyphIndexAt(x, y)
+    if (index < 0) return false
+    const glyph = glyphsRef.current[index]
+    const now = performance.now()
+    glyph.alive = false
+    glyph.held = false
+    glyph.respawnAt = now + 3350
+    glyph.vx = 0
+    glyph.vy = 0
+    if (dragRef.current?.index === index) dragRef.current = null
+    const droplets = Array.from({ length: 12 }, (_, dropletIndex): PopDroplet => ({
+      angle: (Math.PI * 2 * dropletIndex) / 12 + (Math.random() - .5) * .28,
+      speed: glyph.fontSize * (.32 + Math.random() * .38),
+      size: Math.max(1.5, glyph.fontSize * (.008 + Math.random() * .012)),
+      hue: [184, 312, 48][dropletIndex % 3],
+    }))
+    popEffectsRef.current.push({ ch: glyph.ch, x: glyph.x + glyph.ox, y: glyph.y + glyph.oy, angle: glyph.angle, fontSize: glyph.fontSize, startedAt: now, droplets })
+    contactsRef.current.clear()
+    return true
+  }, [glyphIndexAt])
 
   const moveDrag = useCallback((x: number, y: number, source: Drag['source']) => {
     const drag = dragRef.current
@@ -351,7 +433,7 @@ function App() {
     if (!glyph) return
     const now = performance.now()
     const dt = Math.max(.008, Math.min(.08, (now - drag.lastTime) / 1000))
-    const maxThrowSpeed = 2400 * Math.min(devicePixelRatio, 1.25)
+    const maxThrowSpeed = 2400 * Math.min(devicePixelRatio, 1)
     const sampleVx = Math.max(-maxThrowSpeed, Math.min(maxThrowSpeed, (x - drag.lastX) / dt))
     const sampleVy = Math.max(-maxThrowSpeed, Math.min(maxThrowSpeed, (y - drag.lastY) / dt))
     glyph.vx += (sampleVx - glyph.vx) * .42
@@ -379,6 +461,12 @@ function App() {
     const point = pointerPosition(event)
     moveDrag(point.x, point.y, 'pointer')
   }, [moveDrag, pointerPosition])
+
+  const onDoubleClick = useCallback((event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const point = pointerPosition(event)
+    releaseDrag('pointer')
+    popGlyphAt(point.x, point.y)
+  }, [pointerPosition, popGlyphAt, releaseDrag])
 
   useEffect(() => {
     let stream: MediaStream | null = null
@@ -416,6 +504,8 @@ function App() {
     let pinching = false
     let smoothThumb: HandPoint | null = null
     let smoothIndex: HandPoint | null = null
+    let previousIndexSample: { x: number; y: number; time: number; glyph: number } | null = null
+    let pokeCooldownUntil = 0
     const inferenceCanvas = document.createElement('canvas')
     const inferenceContext = inferenceCanvas.getContext('2d', { alpha: false })!
 
@@ -431,11 +521,11 @@ function App() {
       if (stopped) return
       const video = videoRef.current
       const canvas = canvasRef.current
-      if (landmarker && video && canvas && cameraReadyRef.current && cameraChoiceRef.current === 'camera' && video.readyState >= 2 && now - lastDetection >= 50) {
+      if (landmarker && video && canvas && cameraReadyRef.current && cameraChoiceRef.current === 'camera' && video.readyState >= 2 && now - lastDetection >= 67) {
         lastDetection = now
         const videoWidth = Math.max(1, video.videoWidth)
         const videoHeight = Math.max(1, video.videoHeight)
-        const inferenceScale = Math.min(1, 640 / Math.max(videoWidth, videoHeight))
+        const inferenceScale = Math.min(1, 512 / Math.max(videoWidth, videoHeight))
         const inferenceWidth = Math.max(1, Math.round(videoWidth * inferenceScale))
         const inferenceHeight = Math.max(1, Math.round(videoHeight * inferenceScale))
         if (inferenceCanvas.width !== inferenceWidth || inferenceCanvas.height !== inferenceHeight) {
@@ -454,6 +544,26 @@ function App() {
           const palmScale = Math.max(.001, Math.hypot(hand[0].x - hand[5].x, hand[0].y - hand[5].y))
           const ratio = pinchDistance / palmScale
           const nextPinching = pinching ? ratio < .48 : ratio < .32
+          const indexPx = indexRaw.x * canvas.width
+          const indexPy = indexRaw.y * canvas.height
+          const indexGlyph = glyphIndexAt(indexPx, indexPy)
+          if (styleRef.current === 'bubble' && !nextPinching && previousIndexSample && now >= pokeCooldownUntil) {
+            const sampleDt = Math.max(.02, (now - previousIndexSample.time) / 1000)
+            const motionX = indexPx - previousIndexSample.x
+            const motionY = indexPy - previousIndexSample.y
+            const motionLength = Math.hypot(motionX, motionY)
+            const speed = motionLength / sampleDt
+            const pokeThreshold = Math.min(canvas.width, canvas.height) * 1.1
+            const target = glyphsRef.current[indexGlyph]
+            const targetX = target ? target.x + target.ox - previousIndexSample.x : 0
+            const targetY = target ? target.y + target.oy - previousIndexSample.y : 0
+            const targetDistance = Math.hypot(targetX, targetY)
+            const approach = motionLength > 0 && targetDistance > 0 ? (motionX * targetX + motionY * targetY) / (motionLength * targetDistance) : 0
+            if (indexGlyph >= 0 && previousIndexSample.glyph !== indexGlyph && speed >= pokeThreshold && approach > .72 && popGlyphAt(indexPx, indexPy)) {
+              pokeCooldownUntil = now + 650
+            }
+          }
+          previousIndexSample = { x: indexPx, y: indexPy, time: now, glyph: indexGlyph }
           const midpoint = { x: (smoothThumb.x + smoothIndex.x) * .5, y: (smoothThumb.y + smoothIndex.y) * .5 }
           const px = midpoint.x * canvas.width
           const py = midpoint.y * canvas.height
@@ -468,6 +578,7 @@ function App() {
           pinching = false
           smoothThumb = null
           smoothIndex = null
+          previousIndexSample = null
           setHandPoints(null)
           setHandStatus('NO HAND')
         }
@@ -498,10 +609,12 @@ function App() {
       releaseDrag('hand')
       landmarker?.close()
     }
-  }, [moveDrag, pickGlyph, releaseDrag])
+  }, [glyphIndexAt, moveDrag, pickGlyph, popGlyphAt, releaseDrag])
 
   useEffect(() => {
     const canvas = canvasRef.current!
+    const fxCanvas = fxCanvasRef.current!
+    const fxCtx = fxCanvas.getContext('2d')!
     const gl = canvas.getContext('webgl2', { alpha: false, antialias: true })
     if (!gl) { setCameraNotice('WebGL2 unavailable'); return }
     const program = createProgram(gl, fragmentShader)
@@ -548,14 +661,18 @@ function App() {
     let fpsAt = performance.now()
     let physicsAt = performance.now()
     let physicsAccumulator = 0
+    let fxWasActive = false
+    let targetsReady = false
 
     function resize() {
-      const dpr = Math.min(devicePixelRatio, 1.25)
+      const dpr = Math.min(devicePixelRatio, 1)
       const w = Math.floor(innerWidth * dpr)
       const h = Math.floor(innerHeight * dpr)
-      if (canvas.width !== w || canvas.height !== h) {
+      if (!targetsReady || canvas.width !== w || canvas.height !== h) {
         canvas.width = maskCanvas.width = w
         canvas.height = maskCanvas.height = h
+        fxCanvas.width = w
+        fxCanvas.height = h
         halfWidth = Math.max(1, Math.floor(w / 2))
         halfHeight = Math.max(1, Math.floor(h / 2))
         for (const texture of [warpTexture, blurA, blurB]) {
@@ -563,6 +680,7 @@ function App() {
           configureTexture(texture)
           gl!.texImage2D(gl!.TEXTURE_2D, 0, gl!.RGBA8, halfWidth, halfHeight, 0, gl!.RGBA, gl!.UNSIGNED_BYTE, null)
         }
+        targetsReady = true
         layoutKey = ''
       }
     }
@@ -610,6 +728,7 @@ function App() {
       const lineHeight = size
       const startY = h * .53 - ((lines.length - 1) * lineHeight) / 2
       const glyphs: Glyph[] = []
+      let glyphId = 0
       lines.slice(0,4).forEach((value, index) => {
         let x = (w - trackedWidth(value, tracking)) / 2
         for (const char of value) {
@@ -617,14 +736,16 @@ function App() {
           const radiusX = Math.min(size * .38, Math.max(size * .13, width * .43))
           const radiusY = size * .36
           glyphs.push({
-            ch: char, x: x + width / 2, y: startY + index * lineHeight, width, r: Math.sqrt(radiusX * radiusY), rx: radiusX, ry: radiusY, fontSize: size,
+            id: glyphId++, ch: char, x: x + width / 2, y: startY + index * lineHeight, width, r: Math.sqrt(radiusX * radiusY), rx: radiusX, ry: radiusY, fontSize: size,
             ox: 0, oy: 0, vx: 0, vy: 0, angle: 0, angularVelocity: 0,
-            mass: Math.max(.65, width / Math.max(1, size)), held: false,
+            mass: Math.max(.65, width / Math.max(1, size)), held: false, alive: true, respawnAt: 0,
           })
           x += width + tracking
         }
       })
       glyphsRef.current = glyphs
+      contactsRef.current.clear()
+      popEffectsRef.current = []
     }
 
     function drawMask() {
@@ -638,7 +759,7 @@ function App() {
       maskCtx.textAlign = 'center'
       maskCtx.textBaseline = 'middle'
       for (const glyph of glyphsRef.current) {
-        if (!glyph.ch.trim()) continue
+        if (!glyph.alive || !glyph.ch.trim()) continue
         maskCtx.font = `800 ${glyph.fontSize}px "Baloo 2", "Arial Rounded MT Bold", sans-serif`
         maskCtx.save()
         maskCtx.translate(glyph.x + glyph.ox, glyph.y + glyph.oy)
@@ -653,12 +774,26 @@ function App() {
       gl!.pixelStorei(gl!.UNPACK_FLIP_Y_WEBGL, false)
     }
 
-    function stepPhysics(dt: number) {
-      const glyphs = glyphsRef.current.filter((glyph) => glyph.ch.trim())
-      const gravity = canvas.height * 1.35
-      const linearDamping = Math.pow(.994, dt * 60)
-      const angularDamping = Math.pow(.988, dt * 60)
-      const velocityLimit = 3200 * Math.min(devicePixelRatio, 1.25)
+    function stepPhysics(dt: number, now: number) {
+      const bubble = styleRef.current === 'bubble'
+      if (bubble) {
+        for (const glyph of glyphsRef.current) {
+          if (glyph.alive || !glyph.ch.trim() || now < glyph.respawnAt) continue
+          const extentY = Math.max(glyph.rx, glyph.ry)
+          glyph.alive = true
+          glyph.respawnAt = 0
+          glyph.ox = (Math.random() - .5) * glyph.fontSize * .22
+          glyph.oy = canvas.height - extentY - canvas.height * .035 - glyph.y
+          glyph.vx = (Math.random() - .5) * canvas.width * .11
+          glyph.vy = -canvas.height * (.20 + Math.random() * .08)
+          glyph.angularVelocity = (Math.random() - .5) * .65
+        }
+      }
+      const glyphs = glyphsRef.current.filter((glyph) => glyph.alive && glyph.ch.trim())
+      const gravity = canvas.height * (bubble ? -.34 : 1.35)
+      const linearDamping = Math.pow(bubble ? .991 : .994, dt * 60)
+      const angularDamping = Math.pow(bubble ? .982 : .988, dt * 60)
+      const velocityLimit = 3200 * Math.min(devicePixelRatio, 1)
       const smoothImpact = (speed: number, low: number, high: number, minimum: number, maximum: number) => {
         const linear = Math.max(0, Math.min(1, (speed - low) / (high - low)))
         const eased = linear * linear * (3 - 2 * linear)
@@ -667,6 +802,10 @@ function App() {
       for (const glyph of glyphs) {
         if (!glyph.held) {
           glyph.vy += gravity * dt
+          if (bubble) {
+            glyph.vx += Math.sin(now * .00072 + glyph.id * 1.91) * canvas.width * .018 * dt
+            glyph.angularVelocity += Math.sin(now * .00053 + glyph.id * 2.37) * .11 * dt
+          }
           glyph.vx *= linearDamping
           glyph.vy *= linearDamping
           glyph.angularVelocity *= angularDamping
@@ -692,19 +831,53 @@ function App() {
             if (distance < .001) { dx = 1; dy = 0; distance = 1 }
             const nx = dx / distance, ny = dy / distance
             const minimum = support(a, nx, ny) + support(b, -nx, -ny)
+            const relativeX = b.vx - a.vx, relativeY = b.vy - a.vy
+            const impactSpeed = Math.hypot(relativeX, relativeY)
+            const pairKey = a.id < b.id ? `${a.id}:${b.id}` : `${b.id}:${a.id}`
+            if (bubble && iteration === 0) {
+              const range = minimum * 1.12
+              let contact = contactsRef.current.get(pairKey)
+              if (distance < range) {
+                if (!contact && impactSpeed < 900) {
+                  contact = { startedAt: now, cooldownUntil: 0 }
+                  contactsRef.current.set(pairKey, contact)
+                }
+                if (contact && now >= contact.cooldownUntil) {
+                  const age = now - contact.startedAt
+                  if (age < 450) {
+                    const pull = Math.max(0, distance - minimum * .94) * 3.5 * dt
+                    if (!a.held) { a.vx += nx * pull; a.vy += ny * pull }
+                    if (!b.held) { b.vx -= nx * pull; b.vy -= ny * pull }
+                    if (!a.held) { a.vx += relativeX * .015; a.vy += relativeY * .015 }
+                    if (!b.held) { b.vx -= relativeX * .015; b.vy -= relativeY * .015 }
+                  } else {
+                    const separate = 55
+                    if (!a.held) { a.vx -= nx * separate; a.vy -= ny * separate }
+                    if (!b.held) { b.vx += nx * separate; b.vy += ny * separate }
+                    contact.cooldownUntil = now + 650
+                  }
+                }
+              } else if (contact && now >= contact.cooldownUntil) {
+                contactsRef.current.delete(pairKey)
+              }
+            }
             if (distance >= minimum) continue
             const invA = a.held ? 0 : 1 / a.mass
             const invB = b.held ? 0 : 1 / b.mass
             const invSum = invA + invB
             if (invSum <= 0) continue
-            const correction = Math.max(0, minimum - distance - .35) * .72 / invSum
+            const contact = contactsRef.current.get(pairKey)
+            const sticking = bubble && !!contact && now >= contact.cooldownUntil && now - contact.startedAt < 450
+            const correctionStrength = sticking ? .25 : .72
+            const correction = Math.max(0, minimum - distance - .35) * correctionStrength / invSum
             a.ox -= nx * correction * invA; a.oy -= ny * correction * invA
             b.ox += nx * correction * invB; b.oy += ny * correction * invB
-            const relativeX = b.vx - a.vx, relativeY = b.vy - a.vy
             const alongNormal = relativeX * nx + relativeY * ny
             if (alongNormal < 0) {
-              const restitution = smoothImpact(-alongNormal, 180, 1400, .12, .58)
-              const impulseLimit = 2200 * Math.min(devicePixelRatio, 1.25)
+              const restitution = sticking ? .02 : bubble
+                ? smoothImpact(-alongNormal, 160, 1100, .08, .38)
+                : smoothImpact(-alongNormal, 180, 1400, .12, .58)
+              const impulseLimit = 2200 * Math.min(devicePixelRatio, 1)
               const impulse = Math.min(impulseLimit, -(1 + restitution) * alongNormal / invSum)
               const impulseX = impulse * nx, impulseY = impulse * ny
               if (!a.held) { a.vx -= impulseX * invA; a.vy -= impulseY * invA }
@@ -723,12 +896,26 @@ function App() {
         const cosine = Math.abs(Math.cos(glyph.angle)), sine = Math.abs(Math.sin(glyph.angle))
         const extentX = cosine * glyph.rx + sine * glyph.ry
         const extentY = sine * glyph.rx + cosine * glyph.ry
-        if (cx < extentX) { glyph.ox += extentX - cx; glyph.vx = Math.abs(glyph.vx) * smoothImpact(Math.abs(glyph.vx), 180, 1500, .12, .5); glyph.angularVelocity *= .82; cx = extentX }
-        if (cx > canvas.width - extentX) { glyph.ox -= cx - (canvas.width - extentX); glyph.vx = -Math.abs(glyph.vx) * smoothImpact(Math.abs(glyph.vx), 180, 1500, .12, .5); glyph.angularVelocity *= .82 }
-        if (cy < extentY) { glyph.oy += extentY - cy; glyph.vy = Math.abs(glyph.vy) * smoothImpact(Math.abs(glyph.vy), 200, 1600, .1, .44); cy = extentY }
+        const wallBounce = bubble ? .28 : smoothImpact(Math.abs(glyph.vx), 180, 1500, .12, .5)
+        if (cx < extentX) { glyph.ox += extentX - cx; glyph.vx = Math.abs(glyph.vx) * wallBounce; glyph.angularVelocity *= .82; cx = extentX }
+        if (cx > canvas.width - extentX) { glyph.ox -= cx - (canvas.width - extentX); glyph.vx = -Math.abs(glyph.vx) * wallBounce; glyph.angularVelocity *= .82 }
+        if (bubble) {
+          const ceiling = canvas.height * .055 + extentY
+          if (cy < ceiling) {
+            const penetration = ceiling - cy
+            glyph.oy += penetration * .28
+            glyph.vy += penetration * 8 * dt
+            if (glyph.vy < 0) glyph.vy *= .72
+            cy = glyph.y + glyph.oy
+          }
+        } else if (cy < extentY) {
+          glyph.oy += extentY - cy
+          glyph.vy = Math.abs(glyph.vy) * smoothImpact(Math.abs(glyph.vy), 200, 1600, .1, .44)
+          cy = extentY
+        }
         if (cy > canvas.height - extentY) {
           glyph.oy -= cy - (canvas.height - extentY)
-          if (glyph.vy > 0) glyph.vy *= -smoothImpact(glyph.vy, 200, 1600, .1, .44)
+          if (glyph.vy > 0) glyph.vy *= -(bubble ? .18 : smoothImpact(glyph.vy, 200, 1600, .1, .44))
           glyph.angularVelocity += glyph.vx / Math.max(1, glyph.r) * .025
           glyph.vx *= .82
           glyph.angularVelocity *= .74
@@ -745,9 +932,59 @@ function App() {
       const fixedStep = 1 / 60
       let steps = 0
       while (physicsAccumulator >= fixedStep && steps < 4) {
-        stepPhysics(fixedStep)
+        stepPhysics(fixedStep, now)
         physicsAccumulator -= fixedStep
         steps++
+      }
+    }
+
+    function drawPopEffects(now: number) {
+      const active = popEffectsRef.current.filter((effect) => now - effect.startedAt < 350)
+      popEffectsRef.current = active
+      if (!active.length) {
+        if (fxWasActive) {
+          fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height)
+          fxCanvas.style.display = 'none'
+        }
+        fxWasActive = false
+        return
+      }
+      fxWasActive = true
+      fxCanvas.style.display = 'block'
+      fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height)
+      for (const effect of active) {
+        const age = (now - effect.startedAt) / 350
+        const eased = 1 - Math.pow(1 - age, 3)
+        const opacity = Math.pow(1 - age, 1.35)
+        fxCtx.save()
+        fxCtx.translate(effect.x, effect.y)
+        fxCtx.rotate(effect.angle)
+        fxCtx.scale(1 - eased * .36, 1 - eased * .36)
+        fxCtx.font = `800 ${effect.fontSize}px "Baloo 2", "Arial Rounded MT Bold", sans-serif`
+        fxCtx.textAlign = 'center'
+        fxCtx.textBaseline = 'middle'
+        fxCtx.lineJoin = 'round'
+        fxCtx.globalCompositeOperation = 'screen'
+        fxCtx.lineWidth = Math.max(1.2, effect.fontSize * .016)
+        for (const [offset, color] of [[-1.4, `hsla(184,100%,82%,${opacity * .82})`], [0, `hsla(312,100%,84%,${opacity * .72})`], [1.4, `hsla(48,100%,83%,${opacity * .72})`]] as const) {
+          fxCtx.save()
+          fxCtx.translate(offset, 0)
+          fxCtx.strokeStyle = color
+          fxCtx.strokeText(effect.ch, 0, 0)
+          fxCtx.restore()
+        }
+        fxCtx.restore()
+
+        const seconds = (now - effect.startedAt) / 1000
+        for (const droplet of effect.droplets) {
+          const distance = droplet.speed * seconds
+          const px = effect.x + Math.cos(droplet.angle) * distance
+          const py = effect.y + Math.sin(droplet.angle) * distance + effect.fontSize * .7 * seconds * seconds
+          fxCtx.beginPath()
+          fxCtx.arc(px, py, droplet.size * (1 - age * .45), 0, Math.PI * 2)
+          fxCtx.fillStyle = `hsla(${droplet.hue},100%,86%,${opacity * .66})`
+          fxCtx.fill()
+        }
       }
     }
 
@@ -774,7 +1011,8 @@ function App() {
       gl!.bindTexture(gl!.TEXTURE_2D, maskTexture)
       gl!.uniform1i(gl!.getUniformLocation(warpProgram, 'u_source'), 3)
       gl!.uniform1f(gl!.getUniformLocation(warpProgram, 'u_time'), now / 1000)
-      gl!.uniform1f(gl!.getUniformLocation(warpProgram, 'u_wobble'), paramsRef.current.wobble)
+      const wobble = styleRef.current === 'bubble' ? Math.max(paramsRef.current.wobble, .0035) : paramsRef.current.wobble
+      gl!.uniform1f(gl!.getUniformLocation(warpProgram, 'u_wobble'), wobble)
       gl!.uniform1f(gl!.getUniformLocation(warpProgram, 'u_aspect'), canvas.width / canvas.height)
       gl!.drawArrays(gl!.TRIANGLES, 0, 3)
     }
@@ -817,7 +1055,9 @@ function App() {
       gl!.uniform1f(loc('u_refract'), p.refract); gl!.uniform1f(loc('u_disperse'), p.disperse); gl!.uniform1f(loc('u_fresnel'), p.fresnel)
       gl!.uniform1f(loc('u_frost'), p.frost); gl!.uniform1f(loc('u_irid'), p.irid); gl!.uniform1f(loc('u_shadow'), p.shadow)
       gl!.uniform1f(loc('u_fire'), styleRef.current === 'fire' ? 1 : 0)
+      gl!.uniform1f(loc('u_bubble'), styleRef.current === 'bubble' ? 1 : 0)
       gl!.drawArrays(gl!.TRIANGLES, 0, 3)
+      drawPopEffects(now)
       frames++
       if (now - fpsAt > 500) { setFps(Math.round(frames * 1000 / (now - fpsAt))); frames = 0; fpsAt = now }
       raf = requestAnimationFrame(render)
@@ -849,7 +1089,8 @@ function App() {
 
   return (
     <main className="fixed inset-0 overflow-hidden bg-[#0a0e14] text-white">
-      <canvas ref={canvasRef} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={() => releaseDrag('pointer')} onPointerCancel={() => releaseDrag('pointer')} className="absolute inset-0 h-full w-full touch-none" aria-label="Real-time liquid glass rendering; pinch or drag individual letters" />
+      <canvas ref={canvasRef} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={() => releaseDrag('pointer')} onPointerCancel={() => releaseDrag('pointer')} onDoubleClick={onDoubleClick} className="absolute inset-0 h-full w-full touch-none" aria-label="Real-time liquid glass and bubble rendering; pinch or drag letters, double click bubbles to pop" />
+      <canvas ref={fxCanvasRef} className="pointer-events-none absolute inset-0 z-[5] hidden h-full w-full" aria-hidden="true" />
       <video ref={videoRef} className="hidden" muted playsInline />
 
       <AnimatePresence>
@@ -884,8 +1125,9 @@ function App() {
                     </label>
                     <label className="mb-[7px] grid grid-cols-[82px_1fr] items-center gap-2">
                       <span>style</span>
-                      <select value={style} onChange={(event) => setStyle(event.target.value)} className="min-w-0 rounded-[7px] border border-white/20 bg-white/10 px-2 py-[5px] text-[10px] text-white outline-none">
+                      <select value={style} onChange={(event) => setStyle(event.target.value as StyleMode)} className="min-w-0 rounded-[7px] border border-white/20 bg-white/10 px-2 py-[5px] text-[10px] text-white outline-none">
                         <option value="liquid glass" className="text-black">liquid glass</option>
+                        <option value="bubble" className="text-black">bubble</option>
                         <option value="fire" className="text-black">fire</option>
                       </select>
                     </label>
@@ -917,7 +1159,7 @@ function App() {
         {!hidden && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="pointer-events-none fixed inset-0 z-10 font-extrabold text-[10px] uppercase leading-[1.8] tracking-[.14em] text-white/85 [text-shadow:0_1px_8px_rgba(0,0,0,.5)]">
             <div className="absolute bottom-[18px] left-5">
-              <div>H · HIDE UI</div><div>S · SCREENSHOT</div><div>R · RESET LETTERS</div><div>🤏 PINCH · DRAG</div><div className="mt-1 text-white/60">HAND TRACKING · {handStatus}</div>
+              <div>H · HIDE UI</div><div>S · SCREENSHOT</div><div>R · RESET LETTERS</div><div>🤏 PINCH · DRAG</div>{style === 'bubble' && <div>☝ DOUBLE CLICK / QUICK POKE · POP</div>}<div className="mt-1 text-white/60">HAND TRACKING · {handStatus}</div>
             </div>
             <div className="absolute bottom-[18px] right-5">FPS · {fps}</div>
           </motion.div>
