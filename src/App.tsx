@@ -41,15 +41,15 @@ type Params = {
 const defaults: Params = {
   textScale: 1.67,
   spacing: 0,
-  thresh: 0.47,
+  thresh: 0.545,
   wobble: 0,
-  bump: 2.9,
-  refract: 0.36,
-  disperse: 0.09,
-  fresnel: 3.2,
-  frost: 0.006,
-  irid: 0.7,
-  shadow: 0.34,
+  bump: 3.1,
+  refract: 0.406,
+  disperse: 0.102,
+  fresnel: 2,
+  frost: 0.0515,
+  irid: 1.5,
+  shadow: 0.4,
 }
 
 const controls: Array<[keyof Params, string, number, number, number, number]> = [
@@ -74,6 +74,35 @@ void main() {
   gl_Position = vec4(a_position, 0., 1.);
 }`
 
+const warpFragmentShader = `#version 300 es
+precision highp float;
+uniform sampler2D u_source;
+uniform float u_time;
+uniform float u_wobble;
+uniform float u_aspect;
+in vec2 v_uv;
+out vec4 outColor;
+float hash(vec2 p) {
+  p = fract(p * vec2(234.34, 435.345));
+  p += dot(p, p + 34.23);
+  return fract(p.x * p.y);
+}
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3. - 2. * f);
+  return mix(mix(hash(i), hash(i + vec2(1,0)), f.x), mix(hash(i + vec2(0,1)), hash(i + vec2(1)), f.x), f.y);
+}
+void main() {
+  vec2 p = v_uv * vec2(u_aspect, 1.);
+  float t = u_time * .6;
+  vec2 warp = vec2(
+    noise(p * 5. + vec2(t, t * .7)) - .5 + .3 * sin(p.y * 12. + t * 2.1),
+    noise(p * 5. + vec2(-t * .8, t) + 17.3) - .5 + .3 * sin(p.x * 11. - t * 1.7)
+  );
+  float mask = texture(u_source, v_uv + warp * u_wobble).r;
+  outColor = vec4(mask, mask, 0., 1.);
+}`
+
 const fragmentShader = `#version 300 es
 precision highp float;
 uniform sampler2D u_background;
@@ -84,7 +113,6 @@ uniform vec2 u_videoSize;
 uniform float u_time;
 uniform float u_camera;
 uniform float u_thresh;
-uniform float u_wobble;
 uniform float u_bump;
 uniform float u_refract;
 uniform float u_disperse;
@@ -96,17 +124,29 @@ uniform float u_fire;
 in vec2 v_uv;
 out vec4 outColor;
 
-float rand(vec2 p) { return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
+const float TAU = 6.28318530718;
+float hash(vec2 p) {
+  p = fract(p * vec2(234.34, 435.345));
+  p += dot(p, p + 34.23);
+  return fract(p.x * p.y);
+}
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3. - 2. * f);
+  return mix(mix(hash(i), hash(i + vec2(1,0)), f.x), mix(hash(i + vec2(0,1)), hash(i + vec2(1)), f.x), f.y);
+}
+float fbm(vec2 p) {
+  float value = 0., amplitude = .5;
+  for (int i = 0; i < 5; i++) { value += amplitude * noise(p); p = p * 2.03 + 11.7; amplitude *= .5; }
+  return value;
+}
 vec3 sky(vec2 uv) {
-  float t = u_time * .07;
-  vec2 p = uv - .5;
-  float glow = exp(-5.2 * length(p - vec2(-.18 + sin(t) * .12, .12)));
-  float glow2 = exp(-8. * length(p - vec2(.34, -.15 + cos(t*.8)*.08)));
-  vec3 top = vec3(.055, .12, .22);
-  vec3 bot = vec3(.7, .34, .3);
-  vec3 col = mix(bot, top, smoothstep(0., .95, uv.y));
-  col += glow * vec3(.8,.48,.25) + glow2 * vec3(.2,.5,.7);
-  col += .025 * sin(vec3(1.,1.4,1.8) * (uv.x * 13. + uv.y * 8. + t));
+  vec3 col = mix(vec3(.62,.8,.98), vec3(.16,.42,.86), clamp(uv.y * 1.1, 0., 1.));
+  vec2 p = uv * vec2(u_resolution.x / u_resolution.y, 1.) * 2.6 + vec2(u_time * .02, 0.);
+  float cloudNoise = fbm(p + fbm(p * 1.7) * .6);
+  float cloud = smoothstep(.48, .78, cloudNoise);
+  col = mix(col, vec3(.98,.99,1.), cloud * .92);
+  col = mix(col, vec3(.72,.8,.92), cloud * (1. - smoothstep(.55,.95,cloudNoise)) * .35);
   return col;
 }
 vec3 bg(vec2 uv) {
@@ -119,69 +159,79 @@ vec3 bg(vec2 uv) {
   cameraUv.x = 1. - cameraUv.x;
   return texture(u_background, clamp(cameraUv, .001, .999)).rgb;
 }
-float maskAt(vec2 uv) {
-  float wob = u_wobble * sin(uv.y * 31. + u_time * 2.1) * sin(uv.x * 19. - u_time);
-  return texture(u_mask, uv + vec2(wob, wob * .45)).r;
+vec3 bgBlur(vec2 uv, float radius) {
+  if (radius < .0005) return bg(uv);
+  vec2 px = radius / u_resolution * u_resolution.y;
+  vec3 sum = bg(uv) * .294;
+  sum += bg(uv + vec2(.85,.26) * px) * .1765;
+  sum += bg(uv + vec2(-.42,.79) * px) * .1765;
+  sum += bg(uv + vec2(-.71,-.54) * px) * .1765;
+  sum += bg(uv + vec2(.38,-.83) * px) * .1765;
+  return sum;
 }
-float edgeBand(float value, float threshold) {
-  return smoothstep(threshold - .04, threshold - .03, value)
-    * (1. - smoothstep(threshold - .03, threshold - .01, value));
+float profile(float height) {
+  float t = clamp((height - u_thresh) / (1. - u_thresh), 0., 1.);
+  float k = 1. - t;
+  return sqrt(max(1. - k * k, 0.));
+}
+float heightAt(vec2 uv) { return profile(texture(u_height, uv).r); }
+float softbox(vec3 reflected) {
+  float band1 = smoothstep(.12,.32,reflected.y) * smoothstep(.62,.42,reflected.y);
+  float band2 = smoothstep(-.55,-.4,reflected.y) * smoothstep(-.18,-.34,reflected.y) * .35;
+  float side = smoothstep(.5,.9,abs(reflected.x)) * .15;
+  return band1 + band2 + side;
 }
 void main() {
   vec2 uv = v_uv;
-  vec2 px = 1. / u_resolution;
-  float m = maskAt(uv);
-  float radius = 1.2 + u_bump * .34;
-  float height = texture(u_height, uv).r;
-  float hL = texture(u_height, uv - vec2(px.x * radius, 0.)).r;
-  float hR = texture(u_height, uv + vec2(px.x * radius, 0.)).r;
-  float hD = texture(u_height, uv - vec2(0., px.y * radius)).r;
-  float hU = texture(u_height, uv + vec2(0., px.y * radius)).r;
-  float gloop = clamp((u_thresh - .15) / .7, 0., 1.);
-  float fusionThreshold = mix(.52, .24, gloop);
-  float gate = smoothstep(fusionThreshold - .055, fusionThreshold + .035, max(m * .9, height));
-  vec2 slope = vec2(hR - hL, hU - hD);
-  float slopeLength = length(slope);
-  vec2 normal = slopeLength > .00001 ? normalize(slope) : vec2(0.);
-  float bevel = smoothstep(.012, .072, slopeLength);
-  float inner = smoothstep(fusionThreshold + .02, .88, height);
-  vec2 surfaceWarp = vec2(sin(uv.y * 19. + u_time * .35), cos(uv.x * 17. - u_time * .3)) * .002 * inner;
-  vec2 bend = normal * u_refract * mix(.082, .03, inner) + surfaceWarp * u_refract;
-  float dispersion = u_disperse * .012;
-  vec3 refracted;
-  refracted.r = bg(uv + bend + normal * dispersion).r;
-  refracted.g = bg(uv + bend).g;
-  refracted.b = bg(uv + bend - normal * dispersion).b;
-  float noise = rand(floor(uv * u_resolution * .45) + floor(u_time * 8.));
-  refracted = mix(refracted, vec3(dot(refracted, vec3(.299,.587,.114))), u_frost * 1.45);
-  refracted += (noise - .5) * u_frost * .24;
-  float rim = pow(clamp(bevel * 1.3, 0., 1.), max(.9, 4.8 - u_fresnel * .48));
-  vec3 rainbow = .5 + .5 * cos(6.283 * (vec3(0.,.33,.67) + atan(normal.y, normal.x)/6.283 + u_time*.025));
-  vec3 glass = refracted;
-  glass = mix(glass, vec3(1.), rim * .3);
-  glass += rainbow * rim * u_irid * .012;
-  glass += vec3(.075) * rim * smoothstep(fusionThreshold, .8, height);
-  float specular = slopeLength > .00001 ? pow(max(0., dot(normalize(vec3(normal, .72)), normalize(vec3(-.35,.55,.76)))), 34.) : 0.;
-  float caustic = slopeLength > .00001 ? pow(max(0., dot(normal, normalize(vec2(.55,.82)))), 5.) * inner : 0.;
-  glass += specular * rim * .24 + caustic * .045;
-  if (u_fire > .5) {
-    vec3 fire = mix(vec3(.55,.015,.005), vec3(1.,.78,.08), clamp(m + uv.y*.5, 0., 1.));
-    glass = mix(fire, vec3(1.,.9,.35), rim);
+  float aspect = u_resolution.x / u_resolution.y;
+  float rawHeight = texture(u_height, uv).r + (hash(uv * u_resolution) - .5) * .004;
+  float antialias = fwidth(rawHeight) * 1.2 + .002;
+  float shape = smoothstep(u_thresh - antialias, u_thresh + antialias, rawHeight);
+  vec3 background = bg(uv);
+  if (u_shadow > .001) {
+    float shadowHeight = profile(texture(u_height, uv + vec2(-.012,.016)).r);
+    background *= 1. - u_shadow * shadowHeight * (1. - shape);
   }
-  float shadowMask = texture(u_height, uv + vec2(-px.x*20., px.y*26.)).r;
-  float shadow = smoothstep(.09,.52,shadowMask) * (1. - gate) * u_shadow * .52;
-  vec3 base = bg(uv);
-  base *= 1. - shadow;
-  vec3 col = mix(base, glass, gate);
-  float fringeOffset = 1.6 + u_disperse * 10.;
-  float fringeR = edgeBand(texture(u_height, uv + normal * px * fringeOffset).r, fusionThreshold);
-  float fringeG = edgeBand(height, fusionThreshold);
-  float fringeB = edgeBand(texture(u_height, uv - normal * px * fringeOffset).r, fusionThreshold);
-  vec3 spectralLine = fringeR * vec3(0., .82, 1.)
-    + fringeG * vec3(1., .04, .72)
-    + fringeB * vec3(1., .86, 0.);
-  col += spectralLine * (1. - gate * .72) * .46;
-  outColor = vec4(col, 1.);
+  if (shape < .001) { outColor = vec4(pow(background, vec3(.98)), 1.); return; }
+
+  float epsilon = 2. / u_resolution.y;
+  float hx = heightAt(uv + vec2(epsilon / aspect, 0.)) - heightAt(uv - vec2(epsilon / aspect, 0.));
+  float hy = heightAt(uv + vec2(0., epsilon)) - heightAt(uv - vec2(0., epsilon));
+  vec3 normal = normalize(vec3(-hx * u_bump, -hy * u_bump, 2. * epsilon * 40.));
+  float height = profile(rawHeight);
+  float sharp = texture(u_mask, uv).r;
+
+  float thickness = u_refract * (.35 + .65 * (1. - height));
+  vec3 incident = vec3(0.,0.,-1.);
+  vec3 refractR = refract(incident, normal, 1. / 1.5);
+  vec3 refractG = refract(incident, normal, 1. / (1.5 + u_disperse));
+  vec3 refractB = refract(incident, normal, 1. / (1.5 + u_disperse * 2.));
+  float frost = u_frost * (1. - sharp * .75);
+  vec2 axis = vec2(1. / aspect, 1.);
+  vec3 refracted;
+  refracted.r = bgBlur(uv + refractR.xy * thickness * axis, frost).r;
+  refracted.g = bgBlur(uv + refractG.xy * thickness * axis, frost).g;
+  refracted.b = bgBlur(uv + refractB.xy * thickness * axis, frost).b;
+  refracted *= mix(vec3(1.), vec3(.93,.98,1.), height * .6);
+
+  float rim = pow(clamp(1. - normal.z, 0., 1.), 1.5);
+  refracted *= 1. - rim * .16;
+  float fresnel = min((.03 + .97 * pow(clamp(1. - normal.z, 0., 1.), 5.)) * u_fresnel, 1.);
+  vec3 reflected = reflect(incident, normal);
+  vec3 environment = bgBlur(clamp(uv + reflected.xy * .22 * axis, 0., 1.), .02) * .55 + vec3(softbox(reflected)) * .95;
+  float phase = (1. - height) * 2.2 + rim * 1.3;
+  vec3 film = .5 + .5 * cos(TAU * phase + vec3(0.,2.1,4.2));
+  vec3 iridescence = film * u_irid * rim * (.4 + .6 * noise(uv * 30. + u_time * .15));
+  vec3 view = vec3(0.,0.,1.);
+  vec3 light1 = normalize(vec3(-.45,.65,.62));
+  vec3 light2 = normalize(vec3(.55,.42,.72));
+  float spec1 = pow(max(dot(normal, normalize(light1 + view)), 0.), 90.) * .9;
+  float spec2 = pow(max(dot(normal, normalize(light2 + view)), 0.), 420.) * 1.6;
+  vec3 glass = refracted * (1. - fresnel * .7) + environment * fresnel + iridescence * (.35 + fresnel) + vec3(spec1 + spec2);
+  if (u_fire > .5) {
+    glass = mix(vec3(.9,.08,0.), vec3(1.,.75,0.), height) + vec3(spec1 + spec2);
+  }
+  outColor = vec4(pow(mix(background, glass, shape), vec3(.98)), 1.);
 }`
 
 const blurFragmentShader = `#version 300 es
@@ -194,11 +244,15 @@ in vec2 v_uv;
 out vec4 outColor;
 void main() {
   vec2 stepUv = u_texel * u_direction * u_radius;
-  float value = texture(u_source, v_uv).r * .227027;
-  value += texture(u_source, v_uv + stepUv * 1.384615).r * .316216;
-  value += texture(u_source, v_uv - stepUv * 1.384615).r * .316216;
-  value += texture(u_source, v_uv + stepUv * 3.230769).r * .070270;
-  value += texture(u_source, v_uv - stepUv * 3.230769).r * .070270;
+  float weights[7];
+  weights[0]=.1964; weights[1]=.1747; weights[2]=.1216; weights[3]=.0661;
+  weights[4]=.0281; weights[5]=.0093; weights[6]=.0024;
+  float value = texture(u_source, v_uv).r * weights[0];
+  for (int i=1; i<7; i++) {
+    float offset = float(i);
+    value += texture(u_source, v_uv + stepUv * offset).r * weights[i];
+    value += texture(u_source, v_uv - stepUv * offset).r * weights[i];
+  }
   outColor = vec4(value, value, value, 1.);
 }`
 
@@ -451,6 +505,7 @@ function App() {
     const gl = canvas.getContext('webgl2', { alpha: false, antialias: true })
     if (!gl) { setCameraNotice('WebGL2 unavailable'); return }
     const program = createProgram(gl, fragmentShader)
+    const warpProgram = createProgram(gl, warpFragmentShader)
     const blurProgram = createProgram(gl, blurFragmentShader)
     const quad = gl.createBuffer()
     gl.bindBuffer(gl.ARRAY_BUFFER, quad)
@@ -481,6 +536,7 @@ function App() {
     const maskTexture = gl.createTexture()!
     gl.activeTexture(gl.TEXTURE1)
     configureTexture(maskTexture)
+    const warpTexture = gl.createTexture()!
     const blurA = gl.createTexture()!
     const blurB = gl.createTexture()!
     const framebuffer = gl.createFramebuffer()!
@@ -502,7 +558,7 @@ function App() {
         canvas.height = maskCanvas.height = h
         halfWidth = Math.max(1, Math.floor(w / 2))
         halfHeight = Math.max(1, Math.floor(h / 2))
-        for (const texture of [blurA, blurB]) {
+        for (const texture of [warpTexture, blurA, blurB]) {
           gl!.bindTexture(gl!.TEXTURE_2D, texture)
           configureTexture(texture)
           gl!.texImage2D(gl!.TEXTURE_2D, 0, gl!.RGBA8, halfWidth, halfHeight, 0, gl!.RGBA, gl!.UNSIGNED_BYTE, null)
@@ -578,22 +634,7 @@ function App() {
       const w = maskCanvas.width, h = maskCanvas.height
       maskCtx.clearRect(0,0,w,h)
       maskCtx.fillStyle = 'white'
-      maskCtx.strokeStyle = 'white'
-      maskCtx.lineCap = 'round'
       maskCtx.lineJoin = 'round'
-      const visible = glyphsRef.current.filter((glyph) => glyph.ch.trim())
-      for (let i = 0; i < visible.length; i++) {
-        for (let j = i + 1; j < visible.length; j++) {
-          const a = visible[i], b = visible[j]
-          const ax = a.x + a.ox, ay = a.y + a.oy, bx = b.x + b.ox, by = b.y + b.oy
-          const gapX = Math.max(0, Math.abs(ax - bx) - (a.width + b.width) * .5)
-          const gapY = Math.max(0, Math.abs(ay - by) - (a.r + b.r) * .72)
-          if (Math.hypot(gapX, gapY) <= 5 * Math.min(devicePixelRatio, 1.25)) {
-            maskCtx.lineWidth = Math.min(a.r, b.r) * .16
-            maskCtx.beginPath(); maskCtx.moveTo(ax, ay); maskCtx.lineTo(bx, by); maskCtx.stroke()
-          }
-        }
-      }
       maskCtx.textAlign = 'center'
       maskCtx.textBaseline = 'middle'
       for (const glyph of glyphsRef.current) {
@@ -724,6 +765,20 @@ function App() {
       gl!.drawArrays(gl!.TRIANGLES, 0, 3)
     }
 
+    function warpPass(now: number) {
+      gl!.bindFramebuffer(gl!.FRAMEBUFFER, framebuffer)
+      gl!.framebufferTexture2D(gl!.FRAMEBUFFER, gl!.COLOR_ATTACHMENT0, gl!.TEXTURE_2D, warpTexture, 0)
+      gl!.viewport(0, 0, halfWidth, halfHeight)
+      bindProgram(warpProgram)
+      gl!.activeTexture(gl!.TEXTURE3)
+      gl!.bindTexture(gl!.TEXTURE_2D, maskTexture)
+      gl!.uniform1i(gl!.getUniformLocation(warpProgram, 'u_source'), 3)
+      gl!.uniform1f(gl!.getUniformLocation(warpProgram, 'u_time'), now / 1000)
+      gl!.uniform1f(gl!.getUniformLocation(warpProgram, 'u_wobble'), paramsRef.current.wobble)
+      gl!.uniform1f(gl!.getUniformLocation(warpProgram, 'u_aspect'), canvas.width / canvas.height)
+      gl!.drawArrays(gl!.TRIANGLES, 0, 3)
+    }
+
     function render(now: number) {
       resize(); simulatePhysics(now); drawMask()
       const video = videoRef.current
@@ -735,10 +790,14 @@ function App() {
         gl!.texImage2D(gl!.TEXTURE_2D, 0, gl!.RGBA, gl!.RGBA, gl!.UNSIGNED_BYTE, video!)
         gl!.pixelStorei(gl!.UNPACK_FLIP_Y_WEBGL, false)
       }
-      let source = maskTexture
-      const radii = [1, 1.75, 2.6]
+      warpPass(now)
+      let source = warpTexture
+      const fontSize = glyphsRef.current.find((glyph) => glyph.ch.trim())?.fontSize || canvas.height * .3
+      const sizeFactor = Math.min(1, fontSize / (canvas.height * .3))
+      const baseRadius = Math.max(.35, (halfHeight / 540) * Math.max(.35, sizeFactor))
+      const radii = [baseRadius, baseRadius * 2, baseRadius * 3]
       for (let index = 0; index < radii.length; index++) {
-        blurPass(source, blurA, 1, 0, radii[index], index === 0 ? canvas.width : halfWidth, index === 0 ? canvas.height : halfHeight)
+        blurPass(source, blurA, 1, 0, radii[index], halfWidth, halfHeight)
         blurPass(blurA, blurB, 0, 1, radii[index], halfWidth, halfHeight)
         source = blurB
       }
@@ -747,14 +806,14 @@ function App() {
       gl!.viewport(0, 0, canvas.width, canvas.height)
       bindProgram(program)
       gl!.activeTexture(gl!.TEXTURE0); gl!.bindTexture(gl!.TEXTURE_2D, bgTexture)
-      gl!.activeTexture(gl!.TEXTURE1); gl!.bindTexture(gl!.TEXTURE_2D, maskTexture)
+      gl!.activeTexture(gl!.TEXTURE1); gl!.bindTexture(gl!.TEXTURE_2D, warpTexture)
       gl!.activeTexture(gl!.TEXTURE2); gl!.bindTexture(gl!.TEXTURE_2D, blurB)
       const loc = (name: string) => gl!.getUniformLocation(program, name)
       gl!.uniform1i(loc('u_background'), 0); gl!.uniform1i(loc('u_mask'), 1); gl!.uniform1i(loc('u_height'), 2)
       gl!.uniform2f(loc('u_resolution'), canvas.width, canvas.height)
       gl!.uniform2f(loc('u_videoSize'), video?.videoWidth || 16, video?.videoHeight || 9)
       gl!.uniform1f(loc('u_time'), now / 1000); gl!.uniform1f(loc('u_camera'), cameraReady ? 1 : 0)
-      gl!.uniform1f(loc('u_thresh'), p.thresh); gl!.uniform1f(loc('u_wobble'), p.wobble); gl!.uniform1f(loc('u_bump'), p.bump)
+      gl!.uniform1f(loc('u_thresh'), p.thresh); gl!.uniform1f(loc('u_bump'), p.bump)
       gl!.uniform1f(loc('u_refract'), p.refract); gl!.uniform1f(loc('u_disperse'), p.disperse); gl!.uniform1f(loc('u_fresnel'), p.fresnel)
       gl!.uniform1f(loc('u_frost'), p.frost); gl!.uniform1f(loc('u_irid'), p.irid); gl!.uniform1f(loc('u_shadow'), p.shadow)
       gl!.uniform1f(loc('u_fire'), styleRef.current === 'fire' ? 1 : 0)
@@ -767,8 +826,8 @@ function App() {
     raf = requestAnimationFrame(render)
     return () => {
       cancelAnimationFrame(raf)
-      gl.deleteProgram(program); gl.deleteProgram(blurProgram); gl.deleteTexture(bgTexture); gl.deleteTexture(maskTexture)
-      gl.deleteTexture(blurA); gl.deleteTexture(blurB); gl.deleteFramebuffer(framebuffer); gl.deleteBuffer(quad)
+      gl.deleteProgram(program); gl.deleteProgram(warpProgram); gl.deleteProgram(blurProgram); gl.deleteTexture(bgTexture); gl.deleteTexture(maskTexture)
+      gl.deleteTexture(warpTexture); gl.deleteTexture(blurA); gl.deleteTexture(blurB); gl.deleteFramebuffer(framebuffer); gl.deleteBuffer(quad)
     }
   }, [cameraChoice])
 
